@@ -10,7 +10,7 @@
 - module：webpack 处理资源的最小单位（不一定是文件）
 - chunk：module 及其所有依赖组成的一个大对象
 - **compiler**：负责整体编译流程，一次编译流程中只存在一个。包含了 webpack 的所有环境配置，如 entry、loader、plugin 等。webpack 启动时会将其实例化，也是 plugin 的 apply 方法中的对象，提供了多个 hook
-- **compilation**：负责编译 module 的对象，每次构建时都会创建一个。包含了当前构建流程的 module 信息、编译生成的资源、变化的文件以及跟踪依赖的状态信息，也提供了很多 hook。在 devServer 中每次热更新时也会创建一个。
+- **compilation**：负责真正构建过程的对象，每次进行构建时都会创建一个。包含了当前构建流程的 module 信息、编译生成的资源(assets)、变化的文件以及跟踪依赖的状态信息，也提供了很多 hook。在 devServer 中每次热更新时都会创建一个。
 
 **webpack 在编译过程中的两个核心对象就是 compiler 和 compilation ，他们都继承自 tapable！** 
 
@@ -22,9 +22,9 @@
 2. 开始编译：通过上一步得到的参数初始化生成 Compiler 对象，**加载所有配置的插件，执行对象的`compiler.run`方法开始编译**
 3. 模块递归编译(buildModule)、依赖收集：从入口文件开始递归的找到的每一个 module 使用 loader 进行预处理(loader-runner)，并且记录 module 之间的依赖关系，生成 dependency graph
 4. 完成编译：封装(seal) chunk。依据 dependency graph ，对 module 进行 seal，生成一个个对 chunk 对象
-5. 输出文件：将上一步得到的 chunk 对象转换成一个单独的文件加入到输出列表（emitAssets？）。这也是修改 module 内容到最后机会根据 output 配置。最后写入文件系统
+5. 输出文件：将上一步得到的 chunk 对象转换成一个单独的文件，**实现 webpack 自己的 require 方法**。然后将文件加入到输出列表（emitAssets）。这也是修改 module 内容的最后机会。最终根据 output 配置，最后写入文件系统
 
-大概的整体流程就是如上，接下来我们深挖细节，一点点的看看 webpack 如何实现。
+大概的流程就是如上，接下来我们深挖细节，一点点的看看 webpack 如何实现。
 
 *实现查看自己的 webpack-yk 项目* 
 
@@ -218,6 +218,8 @@ module.exports = PluginA
 
 到此为止我们更清晰的知道了 plugin 的工作原理，也知道 compiler 对象是如何存储所有的参数了（构造函数中通过 options 属性存储了），接下来就开始正式编译了
 
+**这里加载的是我们的内部插件，webpack 内置了上百个插件，通过`new WebpackOptionApply().process`方法加载，感兴趣的可以直接去看源码**。
+
 #### 从 entry 入口开始编译
 
 编译是从我们配置的 entry 入口开始的。1）在初始化时已经获得了所有的配置，所以我们可以很方便的拿到 entry 配置。但是 entry 配置的路径是相对于根路径的（webpack 的路径相关配置都依赖于这个根路径），根路径在 webpack 中可以通过`context`选项配置，默认值是当前 ndoe 执行的路径。所以我们也要实现相关功能，2）把 entry 中的相对路径转换为绝对路径。
@@ -296,9 +298,11 @@ module.exports = Compiler;
 4. 如果依赖的文件也存在依赖，则递归调用依赖模块进行编译
 5. 所有依赖递归编译完成后，组装成一个个包含多个模块的 chunk
 
-接下来我们就按照这些步骤，继续完善我们的 compiler 对象。我们知道 webpack 在整体的编译流程中，是一个一个模块处理的，然后最后统一输出 chunk 文件。所以在编译流程中，**我们需要对处理完的模块，chunk，待输出的文件进行存储。同时可以在编译流程中通过访问这些存储的对象来影响我们的编译结果**。
+接下来我们就按照这些步骤，继续完善我们的 compiler 对象。我们知道 webpack 在整体的编译流程中，是一个一个模块处理的，然后最后统一输出 chunk 文件。所以在编译流程中，**我们需要对处理完的模块，chunk，待输出的文件进行存放，最后统一打包成 assets 输出**。
 
 所以在正式从入口文件下手前，我们需要做一些准备工作：**声明几个 Set 对象来存储这些编译流程中规定内容** 
+
+**注意：到这里在 webpack 中其实已经交给 compiler 创建的 compilation 对象来处理了，我们的项目中简化了这一步骤，将逻辑全部写在了 compiler 对象中。所以下面的几个属性其实是在 compilation 对象上的。**
 
 ```js
 /* webpack-yk/core/compiler.js */
@@ -823,7 +827,7 @@ creatChunkAssets(callback) {
 
 在上面输出 chunks 的过程中，大部分逻辑都很简单，主要就是通过`fs`将文件写入了磁盘。那核心的`__webpack_require__` webpack 是怎么实现的呢？
 
-首先我们知道 cjs 的 require 在浏览器是不被支持的，所以 webpack 需要实现自己的 cjs 。（不同文件的处理方式可以参考《webpack 打包方式》）
+首先我们知道 cjs 的 require 在浏览器是不被支持的，所以 webpack 需要实现自己的 cjs 。（处理方式可以参考《webpack 打包方式》，这里使用一种简单实现）
 
 我们直接采用比较偷懒的方式（核心理念和 webpack 是相同的）
 
@@ -872,12 +876,5 @@ webpack 源码中是通过生成 AST 再转 code 统一处理的，在它的`Jav
 
 通过这一系列操作，一个建议的 webpack 就实现了，也让我们更加清晰的了解了 webpack 的整个编译过程。下面是手画的流程图
 
-![Webpack编译流程-1](https://liaoyk-markdown.oss-cn-hangzhou.aliyuncs.com/markdownImg/Webpack%E7%BC%96%E8%AF%91%E6%B5%81%E7%A8%8B-1.jpg?x-oss-process=image/resize,w_800,m_lfit) 
+![Webpack编译流程-1 2](https://liaoyk-markdown.oss-cn-hangzhou.aliyuncs.com/markdownImg/Webpack%E7%BC%96%E8%AF%91%E6%B5%81%E7%A8%8B-1%202.jpg?x-oss-process=image/resize,w_800,m_lfit) 
 
-## 参考文章
-
-一文吃透 Webpack 核心原理：https://zhuanlan.zhihu.com/p/363928061
-
-webpack 编译流程：https://juejin.cn/post/6844903935828819981
-
-Webapck5核心打包原理全流程解析：https://juejin.cn/post/703154640003494710
